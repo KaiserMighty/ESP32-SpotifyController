@@ -7,6 +7,12 @@
 #include <driver/gpio.h>
 #include "esp_log.h"
 #include "string.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define I2C_MASTER_SDA_IO       23
 #define I2C_MASTER_SCL_IO       22
@@ -18,6 +24,91 @@
 #define BUTTON_NEXT             21
 #define BUTTON_PLAY             19
 #define BUTTON_PREV             18
+
+#define WIFI_SSID               "SSID"
+#define WIFI_PASS               "PASS"
+#define BROADCAST_PORT          17388
+#define BROADCAST_IP            "255.255.255.255"
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+        esp_wifi_connect();
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        ESP_LOGW("NETWORK", "Disconnected from WiFi. Trying to reconnect...");
+        esp_wifi_connect();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI("NETWORK", "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+
+    wifi_config_t wifi_config =
+    {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
+    esp_wifi_connect();
+}
+
+void send_udp_broadcast(const char *message)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0)
+    {
+        ESP_LOGI("NETWORK", "Failed to create socket: errno %d", errno);
+        return;
+    }
+
+    int broadcastEnable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcastEnable, sizeof(broadcastEnable)) < 0)
+    {
+        ESP_LOGE("NETWORK", "Failed to set broadcast option: errno %d", errno);
+        close(sock);
+        return;
+    }
+
+    struct sockaddr_in addr =
+    {
+        .sin_family = AF_INET,
+        .sin_port = htons(BROADCAST_PORT),
+        .sin_addr.s_addr = inet_addr(BROADCAST_IP),
+    };
+
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK)
+    {
+        ESP_LOGE("NETWORK", "ESP32 is not connected to Wi-Fi");
+        return;
+    }
+
+    if (sendto(sock, message, strlen(message), 0, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        ESP_LOGE("NETWORK", "Error occurred during sending: errno %d", errno);
+
+    close(sock);
+}
 
 gpio_num_t button_pins[4] =
 {
@@ -54,15 +145,19 @@ int check_buttons(void)
             {
                 case 0:
                     ESP_LOGI("BUTTON", "Rotary pressed!");
+                    send_udp_broadcast("SPOTIFY_CONTROLLER:ROTARY");
                     break;
                 case 1:
                     ESP_LOGI("BUTTON", "Skip pressed!");
+                    send_udp_broadcast("SPOTIFY_CONTROLLER:SKIP");
                     break;
                 case 2:
                     ESP_LOGI("BUTTON", "Play pressed!");
+                    send_udp_broadcast("SPOTIFY_CONTROLLER:PLAY");
                     break;
                 case 3:
                     ESP_LOGI("BUTTON", "Back pressed!");
+                    send_udp_broadcast("SPOTIFY_CONTROLLER:BACK");
                     break;
                 default:
                     ESP_LOGI("BUTTON", "Button %d pressed!", i);
@@ -95,7 +190,7 @@ void rotary_init(void)
     gpio_config(&io_conf);
 }
 
-void check_rotary_encoder(void)
+int check_rotary_encoder(void)
 {
     static uint8_t prev_state = 0;
     static int8_t steps_accum = 0;
@@ -106,6 +201,7 @@ void check_rotary_encoder(void)
 
     uint8_t index = (prev_state << 2) | current_state;
     int8_t delta = rotary_table[index];
+    int ret = -1;
 
     if (delta != 0)
     {
@@ -114,14 +210,19 @@ void check_rotary_encoder(void)
         {
             steps_accum = 0;
             ESP_LOGI("ENCODER", "Volume Up!");
+            send_udp_broadcast("SPOTIFY_CONTROLLER:VOLUP");
+            ret = 4;
         }
         else if (steps_accum <= -4)
         {
             steps_accum = 0;
             ESP_LOGI("ENCODER", "Volume Down!");
+            send_udp_broadcast("SPOTIFY_CONTROLLER:VOLDOWN");
+            ret = 5;
         }
     }
     prev_state = current_state;
+    return ret;
 }
 
 i2c_master_bus_handle_t i2c_init()
@@ -158,6 +259,61 @@ ssd1306_handle_t display_init(i2c_master_bus_handle_t i2c_bus)
     return panel_hdl;
 }
 
+void update_display(ssd1306_handle_t handle, int msg_id)
+{
+    switch (msg_id)
+    {
+        case 0:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Rotary Pressed", false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        case 1:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Next Pressed", false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        case 2:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Play Pressed", false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        case 3:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Back Pressed", false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        case 4:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Volume Up", false);
+            vTaskDelay(pdMS_TO_TICKS(2));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        case 5:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Volume Down", false);
+            vTaskDelay(pdMS_TO_TICKS(2));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+            break;
+        default:
+            ssd1306_display_text(handle, 2, "Input Detected!", false);
+            ssd1306_display_text(handle, 3, "Undefined Button", false);
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ssd1306_clear_display_page(handle, 2, false);
+            ssd1306_clear_display_page(handle, 3, false);
+    }
+}
+
 void app_main()
 {
     button_init();
@@ -167,19 +323,27 @@ void app_main()
     ssd1306_display_text(display, 0, "Spotify Controller", false);
     ssd1306_display_text(display, 1, "Debug Mode", false);
 
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    wifi_init();
+
     while (1)
     {
-        check_rotary_encoder();
-        int btn = check_buttons();
-        if (btn != -1)
+        int msg = check_rotary_encoder();
+        if (msg != -1)
         {
-            ssd1306_display_text(display, 2, "Input Detected!", false);
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Button %d pressed", btn);
-            ssd1306_display_text(display, 3, buf, false);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            ssd1306_clear_display_page(display, 2, false);
-            ssd1306_clear_display_page(display, 3, false);
+            update_display(display, msg);
         }
+        msg = check_buttons();
+        if (msg != -1)
+        {
+            update_display(display, msg);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }

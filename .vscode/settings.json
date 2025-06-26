@@ -4,6 +4,7 @@
         "i2c_master.h": "c",
         "gpio.h": "c",
         "freertos.h": "c",
-        "sstream": "c"
+        "sstream": "c",
+        "format": "c"
     }
 }
