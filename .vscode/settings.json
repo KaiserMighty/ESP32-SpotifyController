@@ -5,6 +5,13 @@
         "gpio.h": "c",
         "freertos.h": "c",
         "sstream": "c",
-        "format": "c"
+        "format": "c",
+        "string.h": "c",
+        "ssd1306.h": "c",
+        "stdlib.h": "c",
+        "socket.h": "c",
+        "task.h": "c",
+        "esp_event.h": "c",
+        "stdio.h": "c"
     }
 }
